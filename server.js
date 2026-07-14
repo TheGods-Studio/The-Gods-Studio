@@ -7,6 +7,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const express = require('express');
 const Database = require('better-sqlite3');
+const { sendEmail, MAIL_FROM } = require('./mailer');
 
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, 'public');
@@ -22,7 +23,7 @@ const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
 const GOOGLE_ENABLED = Boolean(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET);
 const DB_SYNC_TOKEN = process.env.DB_SYNC_TOKEN || '';
 
-const PROTECTED_PAGES = new Set(['/shop.html', '/aplicativos.html', '/contato.html']);
+const PROTECTED_PAGES = new Set(['/shop.html', '/aplicativos.html', '/contato.html', '/config.html']);
 
 function getSecret() {
   const fromEnv = process.env.SESSION_SECRET;
@@ -83,6 +84,40 @@ function initDb() {
   } catch (e) {
     console.error('Falha na migração do JSON:', e);
   }
+
+  // Migrações de esquema (colunas novas em `users`)
+  try {
+    const cols = db.prepare('PRAGMA table_info(users)').all().map((r) => r.name);
+    if (!cols.includes('emailVerified')) {
+      db.prepare('ALTER TABLE users ADD COLUMN emailVerified INTEGER NOT NULL DEFAULT 0').run();
+    }
+    if (!cols.includes('twoFactorEnabled')) {
+      db.prepare('ALTER TABLE users ADD COLUMN twoFactorEnabled INTEGER NOT NULL DEFAULT 0').run();
+    }
+  } catch (e) {
+    console.error('Falha na migração de colunas:', e);
+  }
+
+  db.exec(
+    'CREATE TABLE IF NOT EXISTS sessions (' +
+      'id TEXT PRIMARY KEY, ' +
+      'userId TEXT NOT NULL, ' +
+      'device TEXT, ' +
+      'ip TEXT, ' +
+      'location TEXT, ' +
+      'createdAt INTEGER NOT NULL, ' +
+      'lastSeen INTEGER NOT NULL)'
+  );
+
+  db.exec(
+    'CREATE TABLE IF NOT EXISTS action_tokens (' +
+      'token TEXT PRIMARY KEY, ' +
+      'userId TEXT NOT NULL, ' +
+      'type TEXT NOT NULL, ' +
+      'data TEXT, ' +
+      'createdAt INTEGER NOT NULL, ' +
+      'expiresAt INTEGER NOT NULL)'
+  );
 }
 
 function rowToUser(r) {
@@ -95,6 +130,8 @@ function rowToUser(r) {
     provider: r.provider,
     googleSub: r.googleSub,
     createdAt: r.createdAt,
+    emailVerified: Boolean(r.emailVerified),
+    twoFactorEnabled: Boolean(r.twoFactorEnabled),
   };
 }
 function findUserById(id) {
@@ -125,6 +162,85 @@ function countUsers() {
   return row ? row.c : 0;
 }
 
+function deviceFromReq(req) {
+  const ua = (req.get('user-agent') || '').toLowerCase();
+  if (/iphone/.test(ua)) return 'iPhone';
+  if (/ipad/.test(ua)) return 'iPad';
+  if (/android/.test(ua)) return 'Android';
+  if (/windows phone/.test(ua)) return 'Windows Phone';
+  if (/windows/.test(ua)) return 'Windows';
+  if (/macintosh|mac os x/.test(ua)) return 'Mac';
+  if (/linux/.test(ua)) return 'Linux';
+  if (/crawl|bot|spider/.test(ua)) return 'Bot';
+  return 'Dispositivo desconhecido';
+}
+
+function approxLocation(ip) {
+  if (!ip) return 'Local';
+  if (ip === '::1' || ip === '127.0.0.1' || ip === '::ffff:127.0.0.1') return 'Rede local (aprox.)';
+  if (
+    ip.startsWith('10.') ||
+    ip.startsWith('192.168.') ||
+    ip.startsWith('172.16.') ||
+    ip.startsWith('172.17.') ||
+    ip.startsWith('172.18.') ||
+    ip.startsWith('172.19.') ||
+    ip.startsWith('172.2') ||
+    ip.startsWith('172.3')
+  ) {
+    return 'Rede local (aprox.)';
+  }
+  const parts = ip.split('.');
+  if (parts.length === 4) return `IP ${parts[0]}.${parts[1]}.xx.xx (aprox.)`;
+  return `IP ${ip} (aprox.)`;
+}
+
+function createSession(uid, device, ip) {
+  const sid = crypto.randomBytes(24).toString('hex');
+  const now = Date.now();
+  db.prepare(
+    'INSERT INTO sessions (id, userId, device, ip, location, createdAt, lastSeen) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).run(sid, uid, device || 'Desconhecido', ip || '', approxLocation(ip), now, now);
+  return sid;
+}
+
+function deleteSession(sid) {
+  if (!sid) return;
+  try {
+    db.prepare('DELETE FROM sessions WHERE id = ?').run(sid);
+  } catch (_) {}
+}
+
+function createActionToken(userId, type, data, ttlMs) {
+  const token = crypto.randomBytes(24).toString('hex');
+  const now = Date.now();
+  db.prepare(
+    'INSERT INTO action_tokens (token, userId, type, data, createdAt, expiresAt) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(token, userId, type, data ? JSON.stringify(data) : null, now, now + (ttlMs || 30 * 60 * 1000));
+  return token;
+}
+
+function consumeActionToken(token) {
+  if (!token || typeof token !== 'string') return null;
+  const row = db.prepare('SELECT * FROM action_tokens WHERE token = ?').get(token);
+  if (!row) return null;
+  db.prepare('DELETE FROM action_tokens WHERE token = ?').run(token);
+  if (row.expiresAt < Date.now()) return null;
+  let data = null;
+  if (row.data) {
+    try {
+      data = JSON.parse(row.data);
+    } catch (_) {
+      data = null;
+    }
+  }
+  return { type: row.type, userId: row.userId, data };
+}
+
+function baseUrlFromReq(req) {
+  return req.protocol + '://' + req.get('host');
+}
+
 function hashPassword(password) {
   const salt = crypto.randomBytes(16);
   const derived = crypto.scryptSync(password, salt, 64);
@@ -145,8 +261,10 @@ function base64url(buf) {
   return Buffer.from(buf).toString('base64url');
 }
 
-function signSession(uid) {
-  const payload = base64url(JSON.stringify({ uid, iat: Date.now(), exp: Date.now() + SESSION_TTL }));
+function signSession(sid, uid) {
+  const payload = base64url(
+    JSON.stringify({ sid, uid, iat: Date.now(), exp: Date.now() + SESSION_TTL })
+  );
   const sig = crypto.createHmac('sha256', SECRET).update(payload).digest('hex');
   return payload + '.' + sig;
 }
@@ -228,7 +346,14 @@ function validPassword(p) {
 }
 
 function userPublic(u) {
-  return { id: u.id, username: u.username, email: u.email, provider: u.provider || 'local' };
+  return {
+    id: u.id,
+    username: u.username,
+    email: u.email,
+    provider: u.provider || 'local',
+    emailVerified: Boolean(u.emailVerified),
+    twoFactorEnabled: Boolean(u.twoFactorEnabled),
+  };
 }
 
 const app = express();
@@ -277,12 +402,20 @@ function parseCookies(req) {
 function getUserFromReq(req) {
   const cookies = parseCookies(req);
   const data = verifySession(cookies.sid);
-  if (!data) return null;
-  return findUserById(data.uid) || null;
+  if (!data || !data.sid) return null;
+  const sess = db.prepare('SELECT * FROM sessions WHERE id = ?').get(data.sid);
+  if (!sess) return null;
+  if (Date.now() - sess.lastSeen > 60000) {
+    try {
+      db.prepare('UPDATE sessions SET lastSeen = ? WHERE id = ?').run(Date.now(), sess.id);
+    } catch (_) {}
+  }
+  return findUserById(sess.userId) || null;
 }
 
-function setSessionCookie(res, uid) {
-  res.cookie('sid', signSession(uid), {
+function setSessionCookie(res, uid, req) {
+  const sid = createSession(uid, deviceFromReq(req), req && req.ip);
+  res.cookie('sid', signSession(sid, uid), {
     httpOnly: true,
     sameSite: 'lax',
     secure: NODE_ENV === 'production',
@@ -354,7 +487,7 @@ api.post('/signup', (req, res) => {
       createdAt: Date.now(),
     };
     createUser(user);
-    setSessionCookie(res, user.id);
+    setSessionCookie(res, user.id, req);
     return res.json({ ok: true, user: userPublic(user) });
   } catch (err) {
     console.error(err);
@@ -362,7 +495,7 @@ api.post('/signup', (req, res) => {
   }
 });
 
-api.post('/login', (req, res) => {
+api.post('/login', async (req, res) => {
   try {
     const ip = req.ip;
     if (!checkRateLimit('login:' + ip, 20, 15 * 60 * 1000)) {
@@ -399,7 +532,24 @@ api.post('/login', (req, res) => {
       return res.status(401).json({ error: 'E-mail ou senha inválidos.' });
     }
     accountLocks.set('fail:' + lockKey, 0);
-    setSessionCookie(res, user.id);
+
+    if (user.twoFactorEnabled) {
+      const token = createActionToken(user.id, 'two_factor', null, 15 * 60 * 1000);
+      const link = baseUrlFromReq(req) + '/api/action/' + token;
+      await sendEmail({
+        to: user.email,
+        subject: 'Verificação de login - The Gods Studio',
+        html: emailTwoFactorHtml(link),
+      });
+      return res.json({
+        ok: true,
+        twoFactor: true,
+        message:
+          'Enviamos um link de verificação para o seu e-mail. Abra-o para concluir o login com segurança.',
+      });
+    }
+
+    setSessionCookie(res, user.id, req);
     return res.json({ ok: true, user: userPublic(user) });
   } catch (err) {
     console.error(err);
@@ -408,28 +558,335 @@ api.post('/login', (req, res) => {
 });
 
 api.post('/logout', (req, res) => {
+  const cookies = parseCookies(req);
+  const data = verifySession(cookies.sid);
+  if (data && data.sid) deleteSession(data.sid);
   clearSessionCookie(res);
   res.json({ ok: true });
 });
 
-api.post('/change-password', (req, res) => {
+/* === TEMPLATES DE E-MAIL (tema The Gods Studio) === */
+function emailShell(title, bodyHtml) {
+  return (
+    '<!DOCTYPE html><html><head><meta charset="utf-8"><title>' +
+    title +
+    '</title></head>' +
+    '<body style="margin:0;background:#021a1a;font-family:Arial,Helvetica,sans-serif;padding:24px;">' +
+    '<div style="max-width:520px;margin:0 auto;background:rgba(0,0,0,0.6);border:2px solid #00ffea;border-radius:12px;padding:28px;color:#00ffea;">' +
+    '<h1 style="font-size:20px;letter-spacing:1px;text-shadow:0 0 12px rgba(0,255,234,0.5);margin:0 0 18px;">' +
+    title +
+    '</h1>' +
+    bodyHtml +
+    '<p style="font-size:12px;color:#7fffe9;opacity:0.7;margin-top:24px;">The Gods Studio — se você não solicitou isso, ignore este e-mail.</p>' +
+    '</div></body></html>'
+  );
+}
+function emailButton(label, url) {
+  return (
+    '<a href="' +
+    url +
+    '" style="display:inline-block;margin:14px 0;padding:12px 22px;background:linear-gradient(135deg,#00ffea,#00c8b4);color:#000;text-decoration:none;border-radius:8px;font-weight:bold;">' +
+    label +
+    '</a>'
+  );
+}
+function emailVerifyHtml(link) {
+  return emailShell(
+    'Confirme seu e-mail',
+    '<p style="line-height:1.6;">Olá! Confirme que este e-mail pertence a você clicando no botão abaixo. Isso ativa a verificação da sua conta.</p>' +
+      emailButton('Verificar e-mail', link) +
+      '<p style="font-size:12px;word-break:break-all;color:#7fffe9;">Ou copie: ' +
+      link +
+      '</p>'
+  );
+}
+function emailChangeEmailHtml(link) {
+  return emailShell(
+    'Confirmar troca de e-mail',
+    '<p style="line-height:1.6;">Recebemos um pedido para alterar o e-mail da sua conta. Clique abaixo para autorizar a troca.</p>' +
+      emailButton('Autorizar troca', link)
+  );
+}
+function emailChangePasswordHtml(link) {
+  return emailShell(
+    'Confirmar troca de senha',
+    '<p style="line-height:1.6;">Recebemos um pedido para alterar a senha da sua conta. Clique abaixo para autorizar a alteração.</p>' +
+      emailButton('Autorizar alteração', link)
+  );
+}
+function emailResetHtml(link) {
+  return emailShell(
+    'Redefinir senha',
+    '<p style="line-height:1.6;">Recebemos um pedido para redefinir a senha da sua conta. Clique abaixo para criar uma nova senha.</p>' +
+      emailButton('Redefinir senha', link)
+  );
+}
+function emailTwoFactorHtml(link) {
+  return emailShell(
+    'Verificação de login',
+    '<p style="line-height:1.6;">Alguém está tentando entrar na sua conta. Se foi você, confirme o login clicando abaixo.</p>' +
+      emailButton('Confirmar login', link)
+  );
+}
+function emailDisconnectHtml(link) {
+  return emailShell(
+    'Confirmar desconexão',
+    '<p style="line-height:1.6;">Recebemos um pedido para desconectar um dispositivo da sua conta. Clique abaixo para confirmar (isso protege você contra acessos não autorizados).</p>' +
+      emailButton('Confirmar desconexão', link)
+  );
+}
+function emailDisconnectAllHtml(link) {
+  return emailShell(
+    'Confirmar desconexão de todos os dispositivos',
+    '<p style="line-height:1.6;">Recebemos um pedido para desconectar TODOS os dispositivos da sua conta. Clique abaixo para confirmar.</p>' +
+      emailButton('Desconectar todos', link)
+  );
+}
+
+/* === ROTAS DE CONTA (protegidas) === */
+const accountApi = express.Router();
+
+accountApi.post('/request-verify-email', async (req, res) => {
   try {
     const u = getUserFromReq(req);
     if (!u) return res.status(401).json({ error: 'Não autenticado.' });
-    const body = req.body || {};
-    const current = typeof body.current === 'string' ? body.current : '';
-    const next = typeof body.next === 'string' ? body.next : '';
-    if (!verifyPassword(current, u.passwordHash)) {
-      return res.status(400).json({ error: 'Senha atual incorreta.' });
-    }
-    if (!validPassword(next)) {
-      return res.status(400).json({ error: 'A nova senha precisa ter ao menos 8 caracteres, com letras e números.' });
-    }
-    updatePasswordHash(u.id, hashPassword(next));
+    if (u.emailVerified) return res.json({ ok: true, alreadyVerified: true });
+    const token = createActionToken(u.id, 'verify_email', null, 60 * 60 * 1000);
+    const link = baseUrlFromReq(req) + '/api/action/' + token;
+    await sendEmail({ to: u.email, subject: 'Confirme seu e-mail - The Gods Studio', html: emailVerifyHtml(link) });
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Erro interno. Tente novamente.' });
+  }
+});
+
+accountApi.post('/request-change-email', async (req, res) => {
+  try {
+    const u = getUserFromReq(req);
+    if (!u) return res.status(401).json({ error: 'Não autenticado.' });
+    const token = createActionToken(u.id, 'change_email', null, 30 * 60 * 1000);
+    const link = baseUrlFromReq(req) + '/config.html?action=change_email&token=' + token;
+    await sendEmail({ to: u.email, subject: 'Confirmar alteração de e-mail', html: emailChangeEmailHtml(link) });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro interno. Tente novamente.' });
+  }
+});
+
+accountApi.post('/change-email', async (req, res) => {
+  try {
+    const u = getUserFromReq(req);
+    if (!u) return res.status(401).json({ error: 'Não autenticado.' });
+    const body = req.body || {};
+    const token = typeof body.token === 'string' ? body.token : '';
+    const newEmail = typeof body.newEmail === 'string' ? body.newEmail.trim().toLowerCase() : '';
+    const action = consumeActionToken(token);
+    if (!action || action.type !== 'change_email' || action.userId !== u.id) {
+      return res.status(400).json({ error: 'Link inválido ou expirado.' });
+    }
+    if (!validEmail(newEmail)) return res.status(400).json({ error: 'Informe um e-mail válido.' });
+    const existing = findByEmail(newEmail);
+    if (existing && existing.id !== u.id) return res.status(409).json({ error: 'Este e-mail já está em uso.' });
+    db.prepare('UPDATE users SET email = ?, emailVerified = 0 WHERE id = ?').run(newEmail, u.id);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro interno. Tente novamente.' });
+  }
+});
+
+accountApi.post('/request-change-password', async (req, res) => {
+  try {
+    const u = getUserFromReq(req);
+    if (!u) return res.status(401).json({ error: 'Não autenticado.' });
+    const token = createActionToken(u.id, 'change_password', null, 30 * 60 * 1000);
+    const link = baseUrlFromReq(req) + '/config.html?action=change_password&token=' + token;
+    await sendEmail({ to: u.email, subject: 'Confirmar alteração de senha', html: emailChangePasswordHtml(link) });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro interno. Tente novamente.' });
+  }
+});
+
+accountApi.post('/forgot-password', async (req, res) => {
+  try {
+    const body = req.body || {};
+    let u = getUserFromReq(req);
+    if (!u) {
+      const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+      if (!validEmail(email)) return res.status(400).json({ error: 'Informe um e-mail válido.' });
+      u = findByEmail(email);
+      if (!u) return res.status(404).json({ error: 'Nenhuma conta encontrada para este e-mail.' });
+    }
+    const token = createActionToken(u.id, 'reset_password', null, 30 * 60 * 1000);
+    const link = baseUrlFromReq(req) + '/config.html?action=reset_password&token=' + token;
+    await sendEmail({ to: u.email, subject: 'Redefinir senha - The Gods Studio', html: emailResetHtml(link) });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro interno. Tente novamente.' });
+  }
+});
+
+accountApi.post('/set-password', async (req, res) => {
+  try {
+    const u = getUserFromReq(req);
+    if (!u) return res.status(401).json({ error: 'Não autenticado.' });
+    const body = req.body || {};
+    const token = typeof body.token === 'string' ? body.token : '';
+    const next = typeof body.next === 'string' ? body.next : '';
+    const action = consumeActionToken(token);
+    if (!action || (action.type !== 'change_password' && action.type !== 'reset_password') || action.userId !== u.id) {
+      return res.status(400).json({ error: 'Link inválido ou expirado.' });
+    }
+    if (!validPassword(next)) {
+      return res.status(400).json({ error: 'A senha precisa ter ao menos 8 caracteres, com letras e números.' });
+    }
+    updatePasswordHash(u.id, hashPassword(next));
+    const cookies = parseCookies(req);
+    const cur = verifySession(cookies.sid);
+    if (cur && cur.sid) {
+      try {
+        db.prepare('DELETE FROM sessions WHERE userId = ? AND id != ?').run(u.id, cur.sid);
+      } catch (_) {}
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro interno. Tente novamente.' });
+  }
+});
+
+accountApi.post('/change-username', async (req, res) => {
+  try {
+    const u = getUserFromReq(req);
+    if (!u) return res.status(401).json({ error: 'Não autenticado.' });
+    const body = req.body || {};
+    const username = typeof body.username === 'string' ? body.username.trim().toLowerCase() : '';
+    if (!validUsername(username)) {
+      return res.status(400).json({ error: 'Nome de usuário deve ter 3 a 20 caracteres (letras, números ou _).' });
+    }
+    const existing = findByUsername(username);
+    if (existing && existing.id !== u.id) return res.status(409).json({ error: 'Este nome de usuário já está em uso.' });
+    db.prepare('UPDATE users SET username = ? WHERE id = ?').run(username, u.id);
+    res.json({ ok: true, username });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro interno. Tente novamente.' });
+  }
+});
+
+accountApi.post('/set-two-factor', async (req, res) => {
+  try {
+    const u = getUserFromReq(req);
+    if (!u) return res.status(401).json({ error: 'Não autenticado.' });
+    const body = req.body || {};
+    const enabled = Boolean(body.enabled);
+    db.prepare('UPDATE users SET twoFactorEnabled = ? WHERE id = ?').run(enabled ? 1 : 0, u.id);
+    res.json({ ok: true, twoFactorEnabled: enabled });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro interno. Tente novamente.' });
+  }
+});
+
+accountApi.get('/sessions', (req, res) => {
+  try {
+    const u = getUserFromReq(req);
+    if (!u) return res.status(401).json({ error: 'Não autenticado.' });
+    const cookies = parseCookies(req);
+    const data = verifySession(cookies.sid);
+    const currentId = data ? data.sid : null;
+    const rows = db
+      .prepare('SELECT id, device, ip, location, createdAt, lastSeen FROM sessions WHERE userId = ? ORDER BY lastSeen DESC')
+      .all(u.id);
+    res.json({
+      ok: true,
+      sessions: rows.map((r) => Object.assign({}, r, { current: r.id === currentId })),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro interno. Tente novamente.' });
+  }
+});
+
+accountApi.post('/request-disconnect', async (req, res) => {
+  try {
+    const u = getUserFromReq(req);
+    if (!u) return res.status(401).json({ error: 'Não autenticado.' });
+    const body = req.body || {};
+    const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
+    const sess = db.prepare('SELECT * FROM sessions WHERE id = ? AND userId = ?').get(sessionId, u.id);
+    if (!sess) return res.status(400).json({ error: 'Dispositivo não encontrado.' });
+    const token = createActionToken(u.id, 'disconnect_device', { sessionId }, 30 * 60 * 1000);
+    const link = baseUrlFromReq(req) + '/api/action/' + token;
+    await sendEmail({ to: u.email, subject: 'Confirmar desconexão de dispositivo', html: emailDisconnectHtml(link) });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro interno. Tente novamente.' });
+  }
+});
+
+accountApi.post('/request-disconnect-all', async (req, res) => {
+  try {
+    const u = getUserFromReq(req);
+    if (!u) return res.status(401).json({ error: 'Não autenticado.' });
+    const token = createActionToken(u.id, 'disconnect_all', null, 30 * 60 * 1000);
+    const link = baseUrlFromReq(req) + '/api/action/' + token;
+    await sendEmail({
+      to: u.email,
+      subject: 'Confirmar desconexão de todos os dispositivos',
+      html: emailDisconnectAllHtml(link),
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro interno. Tente novamente.' });
+  }
+});
+
+api.use('/account', accountApi);
+
+/* === AÇÃO POR LINK DE E-MAIL (efeito colateral imediato) === */
+api.get('/action/:token', async (req, res) => {
+  try {
+    const action = consumeActionToken(req.params.token);
+    if (!action) return res.status(400).send('Link inválido ou expirado.');
+    if (action.type === 'verify_email') {
+      db.prepare('UPDATE users SET emailVerified = 1 WHERE id = ?').run(action.userId);
+      return res.redirect('/config.html?verified=1');
+    }
+    if (action.type === 'two_factor') {
+      const sid = createSession(action.userId, deviceFromReq(req), req.ip);
+      res.cookie('sid', signSession(sid, action.userId), {
+        httpOnly: true,
+        sameSite: 'lax',
+        secure: NODE_ENV === 'production',
+        path: '/',
+        maxAge: SESSION_TTL,
+      });
+      return res.redirect('/');
+    }
+    if (action.type === 'disconnect_device') {
+      db.prepare('DELETE FROM sessions WHERE id = ? AND userId = ?').run(
+        action.data && action.data.sessionId,
+        action.userId
+      );
+      return res.redirect('/config.html?disconnected=1#security');
+    }
+    if (action.type === 'disconnect_all') {
+      db.prepare('DELETE FROM sessions WHERE userId = ?').run(action.userId);
+      clearSessionCookie(res);
+      return res.redirect('/config.html?disconnected=1');
+    }
+    return res.status(400).send('Ação desconhecida.');
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Erro interno.');
   }
 });
 
@@ -504,7 +961,17 @@ if (GOOGLE_ENABLED) {
           createUser(user);
         }
       }
-      setSessionCookie(res, user.id);
+      if (user.twoFactorEnabled) {
+        const token = createActionToken(user.id, 'two_factor', null, 15 * 60 * 1000);
+        const link = req.protocol + '://' + req.get('host') + '/api/action/' + token;
+        await sendEmail({
+          to: user.email,
+          subject: 'Verificação de login - The Gods Studio',
+          html: emailTwoFactorHtml(link),
+        });
+        return res.redirect('/login.html?twofa=1');
+      }
+      setSessionCookie(res, user.id, req);
       res.redirect('/');
     } catch (err) {
       console.error(err);

@@ -68,9 +68,7 @@
         topButtons.innerHTML =
           '<span class="user-chip">@' +
           escapeHtml(user.username) +
-          '</span><button class="btn btn-outline" id="logout-top">Sair</button>';
-        const lb = document.getElementById('logout-top');
-        if (lb) lb.addEventListener('click', logout);
+          '</span>';
       } else {
         topButtons.querySelectorAll('.btn').forEach((b) => b.classList.add('pulse-attention'));
       }
@@ -88,55 +86,7 @@
     });
 
     const settingsBtn = document.getElementById('settings-btn');
-    if (settingsBtn) {
-      settingsBtn.hidden = !user;
-      if (user) {
-        const info = document.getElementById('settings-info');
-        if (info) info.textContent = 'Conectado como ' + user.email;
-      }
-    }
-  }
-
-  function setupSettingsModal() {
-    const modal = document.getElementById('settings-modal');
-    const openBtn = document.getElementById('settings-btn');
-    const closeBtn = document.getElementById('settings-close');
-    const form = document.getElementById('change-pw-form');
-    const errEl = document.getElementById('change-pw-error');
-
-    if (!modal) return;
-    const open = () => modal.classList.add('open');
-    const close = () => modal.classList.remove('open');
-
-    if (openBtn) openBtn.addEventListener('click', open);
-    if (closeBtn) closeBtn.addEventListener('click', close);
-    modal.addEventListener('click', (e) => {
-      if (e.target === modal) close();
-    });
-
-    const logoutModal = document.getElementById('logout-btn-modal');
-    if (logoutModal) logoutModal.addEventListener('click', logout);
-
-    if (form) {
-      form.addEventListener('submit', async (e) => {
-        e.preventDefault();
-        if (errEl) errEl.textContent = '';
-        const fd = new FormData(form);
-        const current = fd.get('current') || '';
-        const next = fd.get('next') || '';
-        const r = await apiFetch('/api/change-password', {
-          method: 'POST',
-          body: { current, next },
-        });
-        if (r.ok) {
-          form.reset();
-          close();
-          toast('Senha alterada com sucesso.');
-        } else {
-          if (errEl) errEl.textContent = (r.data && r.data.error) || 'Não foi possível alterar a senha.';
-        }
-      });
-    }
+    if (settingsBtn) settingsBtn.hidden = !user;
   }
 
   function setupIndex() {
@@ -149,7 +99,6 @@
         }
       });
     });
-    setupSettingsModal();
   }
 
   function setupAuthForm(formId, isSignup) {
@@ -172,6 +121,16 @@
           body: payload,
         });
         if (r.ok) {
+          if (r.data && r.data.twoFactor) {
+            const info = document.getElementById('auth-info');
+            if (info) {
+              info.textContent = r.data.message;
+              info.style.color = 'rgb(0, 255, 234)';
+            }
+            form.reset();
+            if (submit) submit.disabled = false;
+            return;
+          }
           const next = getParam('next');
           const target = next && next.startsWith('/') ? next : '/';
           window.location.href = target;

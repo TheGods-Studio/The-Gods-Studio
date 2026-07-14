@@ -64,17 +64,68 @@
                     </div>
                     <input class="honeypot" name="hp" tabindex="-1" autocomplete="off" aria-hidden="true">
                     <div class="auth-error" id="auth-error"></div>
+                    <div class="auth-error" id="auth-info"></div>
                     <button class="auth-submit" type="submit">Entrar</button>
                 </form>
 
                 <button class="google-btn" id="google-login" style="display: none;">Entrar com Google</button>
 
                 <p class="auth-switch">Não tem conta? <a href="signup.html">Criar conta</a></p>
+                <div id="forgot-box" hidden style="margin-top: 8px;">
+                    <p class="auth-switch" style="margin: 0 0 10px;">Informe seu e-mail para receber o link de redefinição de senha.</p>
+                    <div class="field">
+                        <label for="forgot-email">E-mail</label>
+                        <input id="forgot-email" type="email" autocomplete="email">
+                    </div>
+                    <button class="auth-submit" id="forgot-btn" type="button" style="margin-top: 12px;">Enviar link</button>
+                    <div class="auth-error" id="forgot-error"></div>
+                </div>
+                <p class="auth-switch"><a href="#" id="forgot-toggle">Esqueci minha senha</a></p>
                 <a class="auth-home" href="index.html">← Voltar ao início</a>
             </div>
         </div>
 
         <script src="auth.js"></script>
+        <script>
+            (function () {
+                var t = document.getElementById('forgot-toggle');
+                var box = document.getElementById('forgot-box');
+                if (t && box) {
+                    t.addEventListener('click', function (e) {
+                        e.preventDefault();
+                        box.hidden = !box.hidden;
+                    });
+                }
+                var btn = document.getElementById('forgot-btn');
+                if (btn) {
+                    btn.addEventListener('click', async function () {
+                        var email = document.getElementById('forgot-email').value.trim();
+                        var err = document.getElementById('forgot-error');
+                        err.textContent = '';
+                        btn.disabled = true;
+                        try {
+                            var r = await fetch('/api/account/forgot-password', {
+                                method: 'POST',
+                                headers: { 'X-Requested-With': 'xmlhttprequest', 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ email: email }),
+                            });
+                            var j = await r.json();
+                            if (r.ok) {
+                                err.style.color = 'rgb(0, 255, 234)';
+                                err.textContent = 'Enviamos um link de redefinição para o seu e-mail.';
+                                box.hidden = true;
+                            } else {
+                                err.textContent = (j && j.error) || 'Não foi possível enviar.';
+                            }
+                        } catch (_) {
+                            err.textContent = 'Erro de conexão. Tente novamente.';
+                        } finally {
+                            btn.disabled = false;
+                        }
+                    });
+                }
+            })();
+        </script>
         <script>
             (function () {
                 const canvas = document.getElementById('matrix-canvas');
