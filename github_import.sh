@@ -3,7 +3,7 @@
 # ============================
 # CONFIGURAÇÃO
 # ============================
-REPO_URL="https://github.com/luismetzker/The-Gods-Studio.git"
+REPO_URL="git@github.com:luismetzker/The-Gods-Studio.git"
 BRANCH="main"
 
 echo "========================================"
